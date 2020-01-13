@@ -8,8 +8,12 @@ import net.coding.ide.entity.ConfigEntity;
 import net.coding.ide.entity.ProjectEntity;
 import net.coding.ide.entity.WorkspaceEntity;
 import net.coding.ide.model.FileInfo;
+import net.coding.ide.model.GitLog;
+import net.coding.ide.model.PersonIdent;
 import org.joda.time.DateTime;
 import org.joda.time.DateTimeZone;
+
+import java.util.Date;
 
 public class DataPopulator {
     private DateTimeZone timeZone = DateTimeZone.forID("UTC");
@@ -17,7 +21,7 @@ public class DataPopulator {
     public ProjectEntity populateProjectEntity(){
         ProjectEntity project = new ProjectEntity();
         project.setName("test-project");
-        project.setSshUrl("git@git.coding.net:kevenyoung03/Test02.git");
+        project.setUrl("git@git.coding.net:kevenyoung03/Test02.git");
         project.setOwnerName("phying");
         return project;
     }
@@ -55,5 +59,23 @@ public class DataPopulator {
         fileInfo.setLastModified(date);
         fileInfo.setLastAccessed(date);
         return fileInfo;
+    }
+
+    public GitLog populateGitLog() {
+        GitLog gitLog = new GitLog();
+        gitLog.setShortName("xxx");
+        gitLog.setName("xxxxxx");
+        gitLog.setShortName("short message");
+        gitLog.setCommitTime((int)new Date().getTime() / 1000);
+        gitLog.setAuthorIdent(populatePersonIdent());
+        gitLog.setCommiterIdent(populatePersonIdent());
+        return gitLog;
+    }
+
+    public PersonIdent populatePersonIdent() {
+        PersonIdent personIdent = new PersonIdent();
+        personIdent.setName("user");
+        personIdent.setEmailAddress("user@coding.net");
+        return personIdent;
     }
 }

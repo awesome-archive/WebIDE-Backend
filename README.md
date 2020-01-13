@@ -1,4 +1,5 @@
 # Coding WebIDE Backend
+[![License](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](https://github.com/Coding/WebIDE/blob/master/LICENSE) [![Build Status](https://travis-ci.org/Coding/WebIDE-Backend.svg?branch=master)](https://travis-ci.org/Coding/WebIDE-Backend) [![Docker Stars](https://img.shields.io/docker/stars/webide/backend.svg)](https://hub.docker.com/r/webide/backend 'DockerHub') [![Docker Pulls](https://img.shields.io/docker/pulls/webide/backend.svg)](https://hub.docker.com/r/webide/backend 'DockerHub')
 
 本项目是开源版 [WebIDE](https://ide.coding.net) 的后端程序。
 
@@ -29,9 +30,9 @@
 
 ## 项目运行
 
-本项目将 `WebIDE` 前端打包成 `webjar`, 作为 maven 依赖引入, 因此在运行本项目前需要先打包前端项目。
+本项目将 [WebIDE-Frontend](https://github.com/Coding/WebIDE-Frontend) 前端打包成 `webjar`, 作为 maven 依赖引入, 因此在运行本项目前需要先打包前端项目。
 
-可以参见 `WebIDE-Workspace` 项目的脚本, 该脚本提供了一键编译、运行 `WebIDE` 的功能)。
+可以参见 [WebIDE](https://github.com/Coding/WebIDE) 项目的[脚本](https://github.com/Coding/WebIDE/blob/master/ide.sh), 该脚本提供了一键编译、运行 `WebIDE` 的功能)。
 
 如果想手动打包前端, 可以参见 `WebIDE-Frontend-Webjars` 项目。
 

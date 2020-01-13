@@ -4,10 +4,13 @@
 
 package net.coding.ide.service;
 
+import net.coding.ide.dto.FileDTO;
 import net.coding.ide.entity.WorkspaceEntity;
 import net.coding.ide.model.FileInfo;
 import net.coding.ide.model.FileSearchResultEntry;
 import net.coding.ide.model.Workspace;
+import net.coding.ide.model.exception.GitCloneAuthFailException;
+import org.eclipse.jgit.api.errors.GitAPIException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 
@@ -21,7 +24,7 @@ public interface WorkspaceManager {
 
     Workspace setup(String spaceKey);
 
-    Workspace createFromUrl(String gitUrl);
+    Workspace createFromUrl(String gitUrl) throws GitCloneAuthFailException;
 
     void delete(String spaceKey);
 
@@ -30,6 +33,8 @@ public interface WorkspaceManager {
     List<WorkspaceEntity> list();
 
     WorkspaceEntity getWorkspaceEntity(String spaceKey);
+
+    FileDTO readFile(Workspace ws, String path, String encoding, boolean base64) throws IOException, GitAPIException, Exception;
 
     FileInfo getFileInfo(Workspace ws, String path) throws Exception;
 

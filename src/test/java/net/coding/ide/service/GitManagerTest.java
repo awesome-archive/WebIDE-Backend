@@ -6,23 +6,30 @@ package net.coding.ide.service;
 
 import com.google.common.cache.LoadingCache;
 import com.google.common.io.Files;
+import lombok.SneakyThrows;
 import net.coding.ide.model.*;
+import net.coding.ide.model.RepositoryState;
 import net.coding.ide.model.exception.GitInvalidPathException;
 import net.coding.ide.model.exception.GitInvalidRefException;
 import net.coding.ide.model.exception.GitOperationException;
 import net.coding.ide.repository.WorkspaceRepository;
 import net.coding.ide.utils.DataPopulator;
 import net.coding.ide.utils.RepositoryHelper;
+import net.coding.ide.web.mapping.PersonIdentConverter;
 import org.apache.commons.io.FileUtils;
+import org.eclipse.jgit.api.CommitCommand;
 import org.eclipse.jgit.api.Git;
+import org.eclipse.jgit.api.LogCommand;
 import org.eclipse.jgit.api.Status;
 import org.eclipse.jgit.api.errors.*;
 import org.eclipse.jgit.junit.JGitTestUtil;
-import org.eclipse.jgit.lib.Ref;
-import org.eclipse.jgit.lib.Repository;
+import org.eclipse.jgit.lib.*;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevTag;
 import org.eclipse.jgit.revwalk.RevWalk;
+import org.eclipse.jgit.revwalk.filter.AuthorRevFilter;
+import org.eclipse.jgit.revwalk.filter.CommitTimeRevFilter;
+import org.eclipse.jgit.revwalk.filter.RevFilter;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Ignore;
@@ -30,18 +37,27 @@ import org.junit.Test;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.Mockito;
+import org.mockito.Spy;
+import org.modelmapper.ModelMapper;
 import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
+import java.util.stream.Collectors;
 
 import static java.util.Arrays.asList;
 import static net.coding.ide.model.DiffEntry.ChangeType.*;
 import static net.coding.ide.model.MergeResponse.Status.CONFLICTING;
+import static net.coding.ide.model.RebaseResponse.RebaseTodoLine.Action.FIXUP;
+import static net.coding.ide.model.RebaseResponse.RebaseTodoLine.Action.REWORD;
+import static net.coding.ide.model.RebaseResponse.RebaseTodoLine.Action.SQUASH;
 import static net.coding.ide.model.RebaseResponse.Status.*;
 import static net.coding.ide.service.GitManagerImpl.*;
 import static net.coding.ide.utils.FilesUtils.createTempDirectoryAndDeleteOnExit;
@@ -77,6 +93,9 @@ public class GitManagerTest extends BaseServiceTest {
 
     private Workspace ws;
 
+    @Spy
+    private ModelMapper mapper = new ModelMapper();
+
     @Before
     public void setUp() throws IOException, GitAPIException, ExecutionException {
         testSpaceHome = createTempDirectoryAndDeleteOnExit("codingSpaceKeys");
@@ -92,6 +111,8 @@ public class GitManagerTest extends BaseServiceTest {
         ReflectionTestUtils.setField(gitMgr, "repoCache", repoCache);
 
         when(repoCache.get(ws.getSpaceKey())).thenReturn(repository);
+
+        mapper.addConverter(new PersonIdentConverter());
 
         // init repo
         initRepo(repository);
@@ -218,6 +239,293 @@ public class GitManagerTest extends BaseServiceTest {
     }
 
     @Test
+    public void testLogWithRootDirectory() throws GitAPIException, IOException {
+        try (Git git = Git.wrap(repository)) {
+
+            // test for size
+            PageRequest request = new PageRequest(0, 10);
+
+            List<GitLog> gitLogs = gitMgr.log(ws, new String[]{"HEAD"}, new String[]{"/"}, null, null, null, request);
+
+            assertEquals(1, gitLogs.size());
+
+            gitLogs = gitMgr.log(ws, new String[]{"HEAD"}, new String[]{"/"}, null, null, null, request);
+
+            assertEquals(1, gitLogs.size());
+        }
+    }
+
+    @Test
+    public void testLogWithoutStash() throws IOException, GitAPIException, GitOperationException {
+        testStashCreate();
+
+        PageRequest request = new PageRequest(0, 10);
+        List<GitLog> logs = gitMgr.log(ws, null, null, null, null, null, request);
+
+        assertEquals(3, logs.size());
+    }
+
+    @Test
+    public void testLogWithPathAndPage() throws IOException, GitAPIException {
+        String filename = "README.md";
+
+        try (Git git = Git.wrap(repository)) {
+            for (int i=1; i<=10; i++) {
+                String message = String.format("modified readme %d times", i);
+                writeFileAndCommit(git, "README.md", message, message);
+            }
+
+            // test for size
+            PageRequest request = new PageRequest(0, 1);
+
+            List<GitLog> gitLogs = gitMgr.log(ws, null, new String[]{filename}, null, null, null, request);
+
+            assertEquals(1, gitLogs.size());
+
+            // test for size greeter than exist
+            request = new PageRequest(0, 14);
+
+            gitLogs = gitMgr.log(ws, new String[] {"HEAD"}, new String[]{filename}, null, null, null, request);
+
+            assertEquals(11, gitLogs.size());
+
+            // test for pages
+            request = new PageRequest(2, 2);
+
+            gitLogs = gitMgr.log(ws, new String[] {"HEAD"}, new String[]{filename}, null, null, null, request);
+
+
+            assertEquals(2, gitLogs.size());
+            assertEquals(7, gitLogs.get(0).getShortName().length());
+            assertEquals(7, gitLogs.get(1).getShortName().length());
+
+            // test for page too large
+            request = new PageRequest(20, 2);
+
+            gitLogs = gitMgr.log(ws, null, new String[]{filename}, null, null, null, request);
+
+            assertEquals(0, gitLogs.size());
+        }
+    }
+
+    @Test
+    public void testLogWithRef() throws IOException, GitAPIException {
+        PageRequest request = new PageRequest(0, 100);
+
+        try (Git git = Git.wrap(repository)) {
+            reCreateCleanRepo();
+
+            RevCommit master1 = writeFileAndCommit(git, "master1", "master1", "master1");
+            RevCommit master2 = writeFileAndCommit(git, "master2", "master2", "master2");
+
+            git.checkout().setCreateBranch(true).setName("branch1").call();
+            git.checkout().setCreateBranch(true).setName("branch2").call();
+
+            git.checkout().setName("branch1").call();
+            RevCommit branch1 = writeFileAndCommit(git, "branch1", "branch1", "branch1");
+
+            git.checkout().setName("branch2").call();
+            RevCommit branch2 = writeFileAndCommit(git, "branch2", "branch2", "branch2");
+
+            List<GitLog> logs = gitMgr.log(ws, new String[]{"branch1"}, null, null, null, null, request);
+
+            assertEquals(3, logs.size());
+            assertEquals(branch1.name(), logs.get(0).getName());
+            assertEquals(master2.name(), logs.get(1).getName());
+            assertEquals(master1.name(), logs.get(2).getName());
+
+            assertEquals(master2.getName(), logs.get(0).getParents()[0]); // master2 is branch1's parents
+            assertEquals(master1.getName(), logs.get(1).getParents()[0]); // master1 is master2's parents
+            assertEquals(0, logs.get(2).getParents().length); // master 1 no parents
+        }
+    }
+
+    @Test
+    public void testLogWithDateFilter() throws IOException, GitAPIException, InterruptedException {
+        PageRequest request = new PageRequest(0, 100);
+
+        try (Git git = Git.wrap(repository)) {
+            reCreateCleanRepo();
+
+            RevCommit master1 = writeFileAndCommit(git, "master1", "master1", "master1");
+
+            Thread.sleep(1000);
+
+            RevCommit master2 = writeFileAndCommit(git, "master2", "master2", "master2");
+
+            Thread.sleep(1000);
+
+            RevCommit master3 = writeFileAndCommit(git, "master3", "master3", "master3");
+
+            List<GitLog> logs = gitMgr.log(ws, null, null, null, null, 1000L * master2.getCommitTime(), request);
+
+            assertEquals(2, logs.size());
+            assertEquals(master2.name(), logs.get(0).getName());
+            assertEquals(master1.name(), logs.get(1).getName());
+
+            logs = gitMgr.log(ws, null, null, null, 1000L * master2.getCommitTime(), null, request);
+
+            assertEquals(2, logs.size());
+            assertEquals(master3.name(), logs.get(0).getName());
+            assertEquals(master2.name(), logs.get(1).getName());
+
+            logs = gitMgr.log(ws, null, null, null, 1000L * master2.getCommitTime(), 1000L * master2.getCommitTime(), request);
+
+            assertEquals(1, logs.size());
+            assertEquals(master2.name(), logs.get(0).getName());
+        }
+    }
+
+    @Test
+    public void testLogWithUserFilter() throws IOException, GitAPIException, InterruptedException {
+        PageRequest request = new PageRequest(0, 100);
+
+        try (Git git = Git.wrap(repository)) {
+            reCreateCleanRepo();
+
+            RevCommit user1 = writeFileAndCommitWithAuthor(git, "user1", "user1@coding.ent", "master1", "master1", "master1");
+
+            Thread.sleep(1000);
+
+            RevCommit user2 = writeFileAndCommitWithAuthor(git, "user2", "user2@coding.ent", "master2", "master2", "master2");
+
+            Thread.sleep(1000);
+
+            RevCommit user3 = writeFileAndCommitWithAuthor(git, "user3", "user3@coding.ent", "master3", "master3", "master3");
+
+            List<GitLog> logs = gitMgr.log(ws, null, null, new String[]{"user1"}, null, null, request);// test regular text
+
+            assertEquals(1, logs.size());
+            assertEquals(user1.name(), logs.get(0).getName());
+
+
+            logs = gitMgr.log(ws, null, null, new String[]{"user[12]"}, null, null, request); // test regex text
+
+            assertEquals(2, logs.size());
+            assertEquals(user2.name(), logs.get(0).getName());
+            assertEquals(user1.name(), logs.get(1).getName());
+
+            // test combine author filter
+            logs = gitMgr.log(ws, null, null,
+                    new String[] {"user2", "user3"},
+                    null,
+                    null,
+                    request);
+
+            assertEquals(2, logs.size());
+            assertEquals(user3.name(), logs.get(0).getName());
+            assertEquals(user2.name(), logs.get(1).getName());
+        }
+    }
+
+    private void reCreateCleanRepo() throws IOException {
+        ws.remove(".git", true);
+        repository.create();
+    }
+
+    @Test
+    public void testLogAll() throws IOException, GitAPIException {
+        PageRequest request = new PageRequest(0, 100);
+
+        try (Git git = Git.wrap(repository)) {
+            ws.remove(".git", true);
+            repository.create();
+
+            RevCommit master1 = writeFileAndCommit(git, "master1", "master1", "master1");
+            RevCommit master2 = writeFileAndCommit(git, "master2", "master2", "master2");
+
+            git.checkout().setCreateBranch(true).setName("branch1").call();
+            git.checkout().setCreateBranch(true).setName("branch2").call();
+
+            git.checkout().setName("branch1").call();
+            RevCommit branch1 = writeFileAndCommit(git, "branch1", "branch1", "branch1");
+
+            git.checkout().setName("branch2").call();
+            RevCommit branch2 = writeFileAndCommit(git, "branch2", "branch2", "branch2");
+
+            List<GitLog> logs = gitMgr.log(ws, null, null, null, null, null, request);
+
+            assertEquals(4, logs.size());
+            assertEquals(branch2.name(), logs.get(0).getName());
+            assertEquals(branch1.name(), logs.get(1).getName());
+            assertEquals(master2.name(), logs.get(2).getName());
+            assertEquals(master1.name(), logs.get(3).getName());
+
+            assertEquals(master2.getName(), logs.get(0).getParents()[0]); // master2 is branch2's parents
+            assertEquals(master2.getName(), logs.get(1).getParents()[0]); // master2 is branch1's parents
+            assertEquals(master1.getName(), logs.get(2).getParents()[0]); // master1 is master2's parents
+            assertEquals(0, logs.get(3).getParents().length); // master 1 no parents
+        }
+    }
+
+
+    @Test
+    public void testBlame() throws GitAPIException, IOException {
+        try (Git git = Git.wrap(repository)) {
+
+            writeFileAndCommit(git, "testBlame", "first commit", "first line");
+            writeFileAndCommit(git, "testBlame", "second commit", "first line", "second line");
+            writeTrashFile("testBlame", "first line\nmodified line\nsecond line\n");
+
+            List<GitBlame> gitBlames = gitMgr.blame(ws, "testBlame");
+
+            assertEquals(3, gitBlames.size());
+            assertNotNull(gitBlames.get(0).getShortName());
+            assertNull(gitBlames.get(1).getShortName());
+            assertNotNull(gitBlames.get(2).getShortName());
+        }
+    }
+
+    @Test
+    public void testBlameWithRename() throws GitAPIException, IOException {
+        try (Git git = Git.wrap(repository)) {
+
+            writeFileAndCommit(git, "testBlame", "first commit", "first line");
+            writeFileAndCommit(git, "testBlame", "second commit", "first line", "second line");
+            writeTrashFile("testBlame", "first line\nmodified line\nsecond line\n");
+            ws.move("testBlame", "renameTestBlame", false);
+
+            git.add().addFilepattern("renameTestBlame").call();
+            git.commit().setMessage("rename file").call();
+
+            writeTrashFile("renameTestBlame", "first line\nsecond modified line after rename\nmodified line\nsecond line\n");
+
+            List<GitBlame> gitBlames = gitMgr.blame(ws, "renameTestBlame");
+
+            assertEquals(4, gitBlames.size());
+
+            assertNotNull(gitBlames.get(0).getShortName());
+            assertNull(gitBlames.get(1).getShortName());
+            assertNotNull(gitBlames.get(2).getShortName());
+            assertNotNull(gitBlames.get(3).getShortName());
+        }
+    }
+
+    @Test
+    public void testBlameNotTracked() throws IOException, GitAPIException {
+        try (Git git = Git.wrap(repository)) {
+
+            writeTrashFile("testBlame", "first line\n1");
+
+            List<GitBlame> gitBlames = gitMgr.blame(ws, "testBlame");
+
+            assertEquals(2, gitBlames.size());
+            assertNull(gitBlames.get(0).getShortName());
+            assertNull(gitBlames.get(1).getShortName());
+        }
+    }
+
+    @Test
+    public void testBlameNotExist() throws IOException, GitAPIException {
+        try (Git git = Git.wrap(repository)) {
+
+            List<GitBlame> gitBlames = gitMgr.blame(ws, "notExist");
+
+            assertEquals(0, gitBlames.size());
+        }
+    }
+
+    @Test
     public void testResolveConflictFile() throws Exception {
         testQueryConflictFile();
 
@@ -246,18 +554,16 @@ public class GitManagerTest extends BaseServiceTest {
     @Test
     @Ignore
     public void testStashCreate() throws IOException, GitAPIException, GitOperationException {
-        ws.write("test", "This is readme", false, true, false);
+        writeTrashFile("test", "This is readme");
 
         Git.wrap(repository).add().addFilepattern("test").call();
 
-        gitMgr.createStash(ws, null);
-
-
+        gitMgr.createStash(ws, false, null);
     }
 
     @Test(expected = GitOperationException.class)
     public void testStashCreateWithException() throws GitAPIException, GitOperationException {
-        gitMgr.createStash(ws, null);
+        gitMgr.createStash(ws, false, null);
     }
 
     @Test
@@ -277,7 +583,7 @@ public class GitManagerTest extends BaseServiceTest {
 
         git.add().addFilepattern("test").call();
 
-        gitMgr.createStash(ws, null);
+        gitMgr.createStash(ws, false, null);
 
         ws.write("test", "This is readme conflict", false, true, false);
 
@@ -347,6 +653,30 @@ public class GitManagerTest extends BaseServiceTest {
     }
 
     @Test
+    public void testStashWithUntractked() throws IOException, GitAPIException, GitOperationException {
+        try (Git git = Git.wrap(repository)) {
+            writeTrashFile("test", "This is readme");
+            writeTrashFile("notTractedFile", "this file is untracked");
+
+            git.add().addFilepattern("test").call();
+
+            gitMgr.createStash(ws, false, null);
+
+            Status status = git.status().call();
+
+            assertEquals(0, status.getAdded().size());
+            assertEquals(1, status.getUntracked().size());
+
+            gitMgr.applyStash(ws, null, false, false);
+
+            status = git.status().call();
+
+            assertEquals(1, status.getAdded().size());
+            assertEquals(1, status.getUntracked().size());
+        }
+    }
+
+    @Test
     public void testDropAllStash() throws GitAPIException, IOException, GitOperationException, InterruptedException {
         testStashCreate();
 
@@ -362,6 +692,25 @@ public class GitManagerTest extends BaseServiceTest {
     }
 
     @Test
+    public void testRefs() throws IOException, GitAPIException, GitOperationException {
+        testStashCreate();
+
+        gitMgr.createBranch(ws, "remoteBranch");
+
+        ws.mkdir(".git/refs/remotes");
+        ws.move(".git/refs/heads/remoteBranch", ".git/refs/remotes/remoteBranch", true);
+
+        List<GitRef> gitRefs = gitMgr.refs(ws);
+
+        assertEquals(5, gitRefs.size());
+        assertEquals("HEAD", gitRefs.get(0).getName());
+        assertEquals("refs/heads/branch1", gitRefs.get(1).getName());
+        assertEquals("refs/heads/branch2", gitRefs.get(2).getName());
+        assertEquals("refs/heads/master", gitRefs.get(3).getName());
+        assertEquals("refs/remotes/remoteBranch", gitRefs.get(4).getName());
+    }
+
+    @Test
     public void testGetDiffEntryForCommit() throws GitAPIException, IOException, GitOperationException {
         ws.write("test", "This is readme", false, true, false);
 
@@ -373,7 +722,7 @@ public class GitManagerTest extends BaseServiceTest {
 
         ws.remove("README2.md", false);
 
-        gitMgr.createStash(ws, null);
+        gitMgr.createStash(ws, false, null);
 
         // will not contain untracked files diff
         List<DiffEntry> entries = gitMgr.getDiffEntryForCommit(ws, "stash@{0}");
@@ -783,6 +1132,161 @@ public class GitManagerTest extends BaseServiceTest {
     }
 
     @Test
+    public void testRebaseForInteractiveSquash() throws IOException, GitAPIException, GitOperationException {
+        try (Git git = Git.wrap(repository)) {
+
+            this.gitMgr.createBranch(ws, "rebase1");
+            this.gitMgr.createBranch(ws, "rebase2");
+            this.gitMgr.checkout(ws, "rebase1", null);
+
+            writeFileAndCommit(git, "A", "add A", "A");
+
+            this.gitMgr.checkout(ws, "rebase2", null);
+
+            writeFileAndCommit(git, "B", "add B", "B");
+
+            writeFileAndCommit(git, "C", "add C", "C");
+
+            writeFileAndCommit(git, "D", "add D", "D");
+
+            RebaseResponse response = this.gitMgr.rebase(ws, "rebase2", "rebase1", true, false);
+
+            assertEquals(RebaseResponse.Status.INTERACTIVE_PREPARED, response.getStatus());
+
+            // update rebase_todo
+            List<RebaseResponse.RebaseTodoLine> lines = response.getRebaseTodoLines();
+
+            lines.get(1).setAction(SQUASH);
+
+            response = this.gitMgr.updateRebaseTodo(ws, lines);
+
+            assertEquals(false, response.isSuccess());
+
+            assertNotNull(response.getMessage());
+
+            response = this.gitMgr.operateRebase(ws, RebaseOperation.CONTINUE);
+
+            assertEquals("INTERACTIVE_EDIT", response.getStatus().name());
+            assertEquals("# This is a combination of 2 commits.\n" +
+                    "# The first commit's message is:\n" +
+                    "add B\n" +
+                    "# This is the 2nd commit message:\n" +
+                    "add C\n", response.getMessage());
+
+            response = this.gitMgr.operateRebase(ws, RebaseOperation.CONTINUE, "squash B and C");
+
+            assertEquals("OK", response.getStatus().name());
+
+            Iterable<RevCommit> iterable = git.log().call();
+
+            assertGitLogMessageEquals(iterable, "add D", "squash B and C", "add A");
+        }
+    }
+
+    @Test
+    public void testRebaseForInteractiveReword() throws IOException, GitAPIException, GitOperationException {
+        try (Git git = Git.wrap(repository)) {
+
+            this.gitMgr.createBranch(ws, "rebase1");
+            this.gitMgr.createBranch(ws, "rebase2");
+            this.gitMgr.checkout(ws, "rebase1", null);
+
+            writeFileAndCommit(git, "A", "add A", "A");
+
+            this.gitMgr.checkout(ws, "rebase2", null);
+
+            writeFileAndCommit(git, "B", "add B", "B");
+
+            writeFileAndCommit(git, "C", "add C", "C");
+
+            writeFileAndCommit(git, "D", "add D", "D");
+
+            RebaseResponse response = this.gitMgr.rebase(ws, "rebase2", "rebase1", true, false);
+
+            assertEquals(RebaseResponse.Status.INTERACTIVE_PREPARED, response.getStatus());
+
+            // update rebase_todo
+            List<RebaseResponse.RebaseTodoLine> lines = response.getRebaseTodoLines();
+
+            lines.get(1).setAction(REWORD);
+            lines.get(2).setAction(REWORD);
+
+            response = this.gitMgr.updateRebaseTodo(ws, lines);
+
+            assertEquals(RebaseResponse.Status.INTERACTIVE_EDIT, response.getStatus());
+            assertEquals(false, response.isSuccess());
+            assertEquals(false, response.isSuccess());
+            assertEquals("add C", response.getMessage());
+
+            response = this.gitMgr.operateRebase(ws, RebaseOperation.CONTINUE);
+
+            assertEquals(RebaseResponse.Status.INTERACTIVE_EDIT, response.getStatus());
+            assertEquals(false, response.isSuccess());
+            assertEquals("add C", response.getMessage());
+
+            response = this.gitMgr.operateRebase(ws, RebaseOperation.CONTINUE, "reword C");
+
+            assertEquals(RebaseResponse.Status.INTERACTIVE_EDIT, response.getStatus());
+            assertEquals(false, response.isSuccess());
+            assertEquals("add D", response.getMessage());
+
+            response = this.gitMgr.operateRebase(ws, RebaseOperation.CONTINUE, "reword D");
+
+            assertEquals("OK", response.getStatus().name());
+
+            Iterable<RevCommit> iterable = git.log().call();
+
+            assertGitLogMessageEquals(iterable, "reword D", "reword C", "add B", "add A");
+        }
+    }
+
+    @Test
+    public void testRebaseForInteractiveFixup() throws Exception {
+        try (Git git = Git.wrap(repository)) {
+
+            this.gitMgr.createBranch(ws, "rebase1");
+            this.gitMgr.createBranch(ws, "rebase2");
+            this.gitMgr.checkout(ws, "rebase1", null);
+
+            writeFileAndCommit(git, "A", "add A", "A");
+
+            this.gitMgr.checkout(ws, "rebase2", null);
+
+            writeFileAndCommit(git, "B", "add B", "B");
+
+            writeFileAndCommit(git, "C", "add C", "C");
+
+            writeFileAndCommit(git, "D", "add D", "D");
+
+            RebaseResponse response = this.gitMgr.rebase(ws, "rebase2", "rebase1", true, false);
+
+            assertEquals(RebaseResponse.Status.INTERACTIVE_PREPARED, response.getStatus());
+
+            // update rebase_todo
+            List<RebaseResponse.RebaseTodoLine> lines = response.getRebaseTodoLines();
+
+            lines.get(1).setAction(FIXUP);
+
+            response = this.gitMgr.updateRebaseTodo(ws, lines);
+
+            assertEquals(RebaseResponse.Status.OK, response.getStatus());
+            assertEquals(true, response.isSuccess());
+
+            Iterable<RevCommit> iterable = git.log().call();
+
+            assertGitLogMessageEquals(iterable, "add D", "add B");
+        }
+    }
+
+    private static void assertGitLogMessageEquals(Iterable iterable, String ...logs) throws GitAPIException {
+        Iterator<RevCommit> revs = iterable.iterator();
+
+        for (int i=0; i<logs.length; i++) {
+            assertEquals(logs[i], revs.next().getFullMessage());
+        }
+    }
+
+    @Test
     public void testRebaseWithInteractiveEdit() throws Exception {
         try (Git git = Git.wrap(repository)) {
 
@@ -1004,6 +1508,18 @@ public class GitManagerTest extends BaseServiceTest {
         assertEquals(content, "branch1");
     }
 
+    @Test
+    public void testForReadFileFromRevWithAbsolutePath() throws IOException {
+
+        String content = this.gitMgr.readFileFromRef(ws, "master", "/README.md", false);
+
+        assertEquals(content, "This is readme");
+
+        content = this.gitMgr.readFileFromRef(ws, "branch1", "/README.md", false);
+
+        assertEquals(content, "branch1");
+    }
+
     @Test(expected = GitInvalidPathException.class)
     public void testForReadFileFromRevWithNotExitFile() throws IOException, GitOperationException {
         this.gitMgr.readFileFromRef(ws, "master", "not_exist", false);
@@ -1069,8 +1585,8 @@ public class GitManagerTest extends BaseServiceTest {
         assertEquals(repository.resolve("branch1"), refs.get(0).getObjectId());
     }
 
-    private RevCommit writeFileAndCommit(Git git, String fileName, String commitMessage,
-                                         String... lines) throws Exception {
+    private RevCommit writeFileAndCommitWithAuthor(Git git, String authorName, String email, String fileName, String commitMessage,
+                                                   String... lines) throws IOException, GitAPIException {
         StringBuilder sb = new StringBuilder();
         for (String line : lines) {
             sb.append(line);
@@ -1078,7 +1594,19 @@ public class GitManagerTest extends BaseServiceTest {
         }
         writeTrashFile(fileName, sb.toString());
         git.add().addFilepattern(fileName).call();
-        return git.commit().setMessage(commitMessage).call();
+
+        CommitCommand commitCommand = git.commit().setMessage(commitMessage);
+
+        if (authorName != null && email != null) {
+            return commitCommand.setAuthor(authorName, email).call();
+        } else {
+            return commitCommand.call();
+        }
+    }
+
+    private RevCommit writeFileAndCommit(Git git, String fileName, String commitMessage,
+                                         String... lines) throws IOException, GitAPIException {
+        return writeFileAndCommitWithAuthor(git, null, null, fileName, commitMessage, lines);
     }
 
     protected File writeTrashFile(final String name, final String data)

@@ -4,12 +4,14 @@
 
 package net.coding.ide.web.controller;
 
+import com.fasterxml.jackson.databind.jsonFormatVisitors.JsonBooleanFormatVisitor;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import net.coding.ide.model.exception.*;
 import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.api.errors.JGitInternalException;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
@@ -23,6 +25,7 @@ import org.springframework.web.multipart.MaxUploadSizeExceededException;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.io.UnsupportedEncodingException;
 
 import static java.lang.String.format;
 import static org.springframework.http.HttpStatus.*;
@@ -33,8 +36,14 @@ import static org.springframework.http.HttpStatus.*;
 @ControllerAdvice
 public class ExceptionAdvice {
 
-    @Value("${UPLOAD_FILE_SIZE_LIMIT}")
-    private int fileSizeLimit;
+    @Value("${spring.http.multipart.max-file-size}")
+    private String fileSizeLimit;
+
+    @ExceptionHandler(UnsupportedEncodingException.class)
+    @ResponseBody
+    public ResponseEntity<JsonObject> unsupportedEncodingException(UnsupportedEncodingException e) {
+        return makeMsgWithHttpStatus(BAD_REQUEST.value(), "unsupported encoding: " + e.getMessage());
+    }
 
     @ExceptionHandler(WorkspaceIOException.class)
     @ResponseStatus(INTERNAL_SERVER_ERROR)
@@ -75,29 +84,28 @@ public class ExceptionAdvice {
 
     @ExceptionHandler(WorkspaceException.class)
     @ResponseBody
-    public ResponseEntity<String> workspaceException(WorkspaceException e) {
-        JsonObject jsonObject = makeMsg(e);
+    public ResponseEntity<JsonObject> workspaceException(WorkspaceException e) {
 
         if (e instanceof WorkspaceMaintainingException) {
-            return new ResponseEntity(jsonObject.toString(), SERVICE_UNAVAILABLE);
+            return makeMsgWithHttpStatus(SERVICE_UNAVAILABLE.value(), e.getMessage());
         } else if (e instanceof WorkspaceMissingException) {
             if (e instanceof WorkspaceDeletedException) {
-                return new ResponseEntity(jsonObject.toString(), GONE);
+                return makeMsgWithHttpStatus(GONE.value(), e.getMessage());
             } else {
-                return new ResponseEntity(jsonObject.toString(), NOT_FOUND);
+                return makeMsgWithHttpStatus(NOT_FOUND.value(), e);
             }
         } else if (e instanceof WorkspaceCreationException) {
-            return new ResponseEntity(jsonObject.toString(), INTERNAL_SERVER_ERROR);
+            return makeMsgWithHttpStatus(INTERNAL_SERVER_ERROR.value(), e);
         }
 
-        return new ResponseEntity(e.getMessage(), NOT_FOUND);
+        return makeMsgWithHttpStatus(NOT_FOUND.value(), e.getMessage());
     }
 
     @ExceptionHandler(MaxUploadSizeExceededException.class)
     @ResponseStatus(PAYLOAD_TOO_LARGE)
     @ResponseBody
     public JsonObject maxUploadSizeExceededException(MaxUploadSizeExceededException e) {
-        return makeMsg(format("Upload file size is limit to %d Mb.", fileSizeLimit));
+        return makeMsg(format("Upload file size is limit to %s.", fileSizeLimit));
     }
 
     @ExceptionHandler(GitCloneAuthFailException.class)
@@ -156,6 +164,13 @@ public class ExceptionAdvice {
         return makeMsg(e);
     }
 
+    @ExceptionHandler(NotFoundException.class)
+    @ResponseStatus(NOT_FOUND)
+    @ResponseBody
+    public ResponseEntity<JsonObject> notfoundException(NotFoundException e) {
+        return makeMsgWithHttpStatus(404, e.getMessage());
+    }
+
     private JsonObject makeMsg(Throwable t) {
         JsonObject jsonObject = makeMsg(t.getMessage());
 
@@ -174,5 +189,35 @@ public class ExceptionAdvice {
         jsonObject.addProperty("msg", msg);
 
         return jsonObject;
+    }
+
+    private JsonObject makeMsg(int code, String msg) {
+        JsonObject jsonObject = new JsonObject();
+
+        jsonObject.addProperty("code", code);
+        jsonObject.addProperty("msg", msg);
+
+        return jsonObject;
+    }
+
+    private JsonObject makeMsg(int code, Throwable t) {
+        JsonObject jsonObject = makeMsg(code, t.getMessage());
+
+        StringWriter sw = new StringWriter();
+        PrintWriter pw = new PrintWriter(sw);
+        t.printStackTrace(pw);
+
+        jsonObject.addProperty("stacktrace", sw.toString());
+
+        return jsonObject;
+    }
+
+
+    private ResponseEntity<JsonObject> makeMsgWithHttpStatus(int httpStatus, String message) {
+        return new ResponseEntity<>(makeMsg(httpStatus, message), HttpStatus.valueOf(httpStatus));
+    }
+
+    private ResponseEntity<JsonObject> makeMsgWithHttpStatus(int httpStatus, Throwable t) {
+        return new ResponseEntity<>(makeMsg(httpStatus, t), HttpStatus.valueOf(httpStatus));
     }
 }

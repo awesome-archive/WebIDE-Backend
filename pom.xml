@@ -344,11 +344,6 @@
             <systemPath>${basedir}/lib/purejavacomm-0.0.17.jar</systemPath>
         </dependency>
 
-        <dependency>
-            <groupId>net.coding.ide</groupId>
-            <artifactId>frontend</artifactId>
-            <version>1.0.0</version>
-        </dependency>
     </dependencies>
 
     <build>
@@ -373,6 +368,34 @@
                     </execution>
                 </executions>
             </plugin>
+            <!-- https://blog.jdriven.com/2014/09/package-only-dependencies-maven/ -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <configuration>
+                  <skip>${skip-webjars}</skip>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>package-only-deps</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>copy</goal>
+                        </goals>
+                        <configuration>
+                            <artifactItems>
+                                <artifactItem>
+                                    <groupId>net.coding.ide</groupId>
+                                    <artifactId>frontend</artifactId>
+                                    <version>1.0.0</version>
+                                </artifactItem>
+                            </artifactItems>
+                            <!-- http://docs.spring.io/spring-boot/docs/current/reference/html/executable-jar.html -->
+                            <outputDirectory>${project.build.directory}/classes/BOOT-INF/lib</outputDirectory>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
         </plugins>
     </build>
 
@@ -384,6 +407,7 @@
         <jgit-version>4.2.0.201601211800-r</jgit-version>
         <docker-java-version>1.3.0</docker-java-version>
         <jackson-jaxrs-version>2.5.4</jackson-jaxrs-version>
+        <skip-webjars>false</skip-webjars>
     </properties>
 
 </project>

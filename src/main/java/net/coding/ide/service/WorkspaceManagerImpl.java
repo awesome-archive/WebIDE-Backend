@@ -10,6 +10,7 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.jcraft.jsch.JSchException;
 import lombok.extern.slf4j.Slf4j;
+import net.coding.ide.dto.FileDTO;
 import net.coding.ide.entity.ProjectEntity;
 import net.coding.ide.entity.WorkspaceEntity;
 import net.coding.ide.event.WorkspaceDeleteEvent;
@@ -36,15 +37,17 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.ApplicationEventPublisherAware;
 import org.springframework.context.ApplicationListener;
+import org.springframework.context.annotation.Scope;
+import org.springframework.context.annotation.ScopedProxyMode;
+import org.springframework.context.event.EventListener;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.io.File;
 import java.io.IOException;
-import java.nio.file.DirectoryStream;
-import java.nio.file.Files;
-import java.nio.file.LinkOption;
-import java.nio.file.Path;
+import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Collections;
 import java.util.Comparator;
@@ -52,16 +55,19 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
+import java.util.stream.Stream;
 
 import static java.lang.String.format;
 import static net.coding.ide.entity.WorkspaceEntity.WsWorkingStatus.*;
+import static org.apache.commons.lang3.StringUtils.isBlank;
 
 /**
  * Created by vangie on 14/11/11.
  */
 @Slf4j
 @Service
-public class WorkspaceManagerImpl extends BaseService implements WorkspaceManager, ApplicationEventPublisherAware, ApplicationListener<WorkspaceStatusEvent> {
+@Scope(proxyMode = ScopedProxyMode.TARGET_CLASS)
+public class WorkspaceManagerImpl extends BaseService implements WorkspaceManager, ApplicationEventPublisherAware {
     private ApplicationEventPublisher publisher;
 
     @Value("${SPACE_HOME}")
@@ -72,6 +78,9 @@ public class WorkspaceManagerImpl extends BaseService implements WorkspaceManage
 
     @Autowired
     private RandomGenerator randomGene;
+
+    @Autowired
+    private WatchedPathStore watchedPathStore;
 
     @Autowired
     private KeyManager keyMgr;
@@ -142,7 +151,7 @@ public class WorkspaceManagerImpl extends BaseService implements WorkspaceManage
             throw new TransportProtocolUnsupportedException("Unsupported git transfer protocol");
         }
 
-        ProjectEntity projectEntity = prjRepo.findBySshUrl(gitUrl);
+        ProjectEntity projectEntity = prjRepo.findByUrl(gitUrl);
 
         if (projectEntity != null) {
             return projectEntity;
@@ -150,7 +159,7 @@ public class WorkspaceManagerImpl extends BaseService implements WorkspaceManage
 
         projectEntity = new ProjectEntity();
 
-        projectEntity.setSshUrl(gitUrl);
+        projectEntity.setUrl(gitUrl);
         setProjectName(projectEntity, gitUrl);
 
         projectEntity.setOwnerName(username);
@@ -191,7 +200,7 @@ public class WorkspaceManagerImpl extends BaseService implements WorkspaceManage
         if (ws == null) {
             String spaceKey;
             do {
-                spaceKey = randomGene.generate(project.getSshUrl());
+                spaceKey = randomGene.generate(project.getUrl());
             } while (wsRepo.isSpaceKeyExist(spaceKey));
 
             WorkspaceEntity wsEntity = new WorkspaceEntity();
@@ -214,7 +223,7 @@ public class WorkspaceManagerImpl extends BaseService implements WorkspaceManage
         projectEntity.setName(projectName);
     }
 
-    private boolean checkGitUrl(String url) {
+    protected boolean checkGitUrl(String url) {
         if (url.startsWith("ssh://")) {
             return true;
         } else if (url.startsWith("https://")
@@ -223,14 +232,14 @@ public class WorkspaceManagerImpl extends BaseService implements WorkspaceManage
                 || url.startsWith("ftp://")
                 || url.startsWith("ftps://")
                 || url.startsWith("rsync://")
-                || url.startsWith("file://")
-                || url.startsWith("/")
                 || url.startsWith("\\")) {
             return false;
         } else if (url.indexOf("@") != -1) {
             return true;
         } else {
-            return false;
+            File dir = new File(url);
+
+            return dir.exists() && dir.isDirectory();
         }
     }
 
@@ -328,25 +337,32 @@ public class WorkspaceManagerImpl extends BaseService implements WorkspaceManage
         return new File(spaceHome, spaceKey);
     }
 
-    @Override
-    public void onApplicationEvent(WorkspaceStatusEvent event) {
+    @Order(Ordered.HIGHEST_PRECEDENCE + 3)
+    @EventListener
+    public void handleWorkspaceStatusEvent(WorkspaceStatusEvent event) {
         String spaceKey = event.getSpaceKey();
 
         if (event instanceof WorkspaceOnlineEvent) {
+            updateWorkingStatus(spaceKey, Online);
             watch(spaceKey);
-
-            wsRepo.updateWorkingStatus(spaceKey, Online);
         } else if (event instanceof WorkspaceOfflineEvent) {
-            unwatch(spaceKey);
-
             if (!wsRepo.isDeleted(spaceKey)) {
-                wsRepo.updateWorkingStatus(spaceKey, Offline);
+                updateWorkingStatus(spaceKey, Offline);
             }
-        } else if (event instanceof WorkspaceDeleteEvent) {
             unwatch(spaceKey);
-            wsRepo.updateWorkingStatus(spaceKey, Deleted);
+        } else if (event instanceof WorkspaceDeleteEvent) {
+            updateWorkingStatus(spaceKey, Deleted);
+            unwatch(spaceKey);
         }
     }
+
+    private void updateWorkingStatus(String spaceKey, WorkspaceEntity.WsWorkingStatus status) {
+        WorkspaceEntity entity = wsRepo.findBySpaceKey(spaceKey);
+        entity.setWorkingStatus(status);
+        wsRepo.save(entity);
+    }
+
+
 
     private void watch(String spaceKey) {
         synchronized (watcherMap) {
@@ -374,7 +390,7 @@ public class WorkspaceManagerImpl extends BaseService implements WorkspaceManage
 
     private WorkspaceWatcher createNewWatcher(String spaceKey) {
         Workspace ws = getWorkspace(spaceKey);
-        return new WorkspaceWatcher(this, ws, publisher);
+        return new WorkspaceWatcher(this, ws, watchedPathStore, publisher);
     }
 
     /**
@@ -428,6 +444,11 @@ public class WorkspaceManagerImpl extends BaseService implements WorkspaceManage
         // set isDirectory, directoriesCount and filesCount
         boolean isDirectory = Files.isDirectory(p); // file not exist will be false
 
+        if (isDirectory) {
+            fileInfo.setDirectoriesCount(count(p, f -> f.isDirectory()));
+            fileInfo.setFilesCount(count(p, f -> f.isFile()));
+        }
+
         fileInfo.setDir(isDirectory);
         fileInfo.setPath(nPath);
         fileInfo.setContentType(FileUtil.getContentType(p.toFile()));
@@ -437,11 +458,40 @@ public class WorkspaceManagerImpl extends BaseService implements WorkspaceManage
         if (!isSymbolicLink
                 || (isSymbolicLink && targetExist)) {
             updateFileTime(fileInfo, p);
+
+            // update file readable and writable
+            updateReadableAndWritable(fileInfo, p);
         } else {
             updateFileTime(fileInfo, p, LinkOption.NOFOLLOW_LINKS);
+
+            // update file readable and writable
+            fileInfo.setReadable(false);
+            fileInfo.setWritable(false);
         }
 
         return fileInfo;
+    }
+
+    private void updateReadableAndWritable(FileInfo fileInfo, Path p) {
+        // set readable, writable
+
+        File file = p.toFile();
+
+        fileInfo.setReadable(file.canRead());
+        fileInfo.setWritable(file.canWrite());
+    }
+
+    @Override
+    public FileDTO readFile(Workspace ws, String path, String encodingParam, boolean base64) throws Exception {
+        FileInfo fileInfo = getFileInfo(ws, path);
+
+        final String encoding = isBlank(encodingParam) ?  ws.getEncoding() : encodingParam;
+
+        return FileDTO.of(path,
+                ws.read(path, encoding, base64),
+                encoding,
+                base64,
+                fileInfo.getLastModified().getMillis());
     }
 
     private void updateFileTime(FileInfo fileInfo, Path p) throws IOException {
@@ -465,6 +515,25 @@ public class WorkspaceManagerImpl extends BaseService implements WorkspaceManage
         fileInfo.setLastModified(lm.withZone(DateTimeZone.getDefault()));
         DateTime la = new DateTime(attr.lastAccessTime().toMillis(), timeZone);
         fileInfo.setLastAccessed(la.withZone(DateTimeZone.getDefault()));
+    }
+
+    /**
+     * 统计目录下指定类型文件的数目
+     * <p>
+     * When following links, and the attributes of the target cannot
+     * be read, then this method attempts to get the {@code BasicFileAttributes}
+     * of the link
+     *
+     * @throws IOException
+     */
+    private int count(Path p, Predicate<File> filter) throws IOException {
+        try (Stream<Path> pathStream = Files.walk(p, 1, FileVisitOption.FOLLOW_LINKS)) {
+            return (int) pathStream
+                    .filter(f -> !f.equals(p)) // walk method will start from p
+                    .map(Path::toFile)
+                    .filter(filter)
+                    .count();
+        }
     }
 
     @Override
@@ -518,6 +587,7 @@ public class WorkspaceManagerImpl extends BaseService implements WorkspaceManage
         // filter out the temporary files
         result = TemporaryFileFilter.filter(result);
 
+        watchedPathStore.add(ws.getSpaceKey(), path.endsWith("/") ? path : path + "/");
         return result;
     }
 

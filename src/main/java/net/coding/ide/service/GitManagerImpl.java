@@ -4,20 +4,28 @@
 
 package net.coding.ide.service;
 
+import com.google.common.base.Strings;
 import com.google.common.cache.*;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.io.BaseEncoding;
 import com.google.common.io.Files;
+import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 import net.coding.ide.event.GitCheckoutEvent;
 import net.coding.ide.event.WorkspaceDeleteEvent;
 import net.coding.ide.event.WorkspaceOfflineEvent;
 import net.coding.ide.event.WorkspaceStatusEvent;
 import net.coding.ide.git.PrivateKeyCredentialsProvider;
+import net.coding.ide.git.rebase.EditActionHandler;
+import net.coding.ide.git.rebase.RebaseActionHandler;
+import net.coding.ide.git.rebase.RewordActionHandler;
+import net.coding.ide.git.rebase.SquashActionHandler;
 import net.coding.ide.model.*;
 import net.coding.ide.model.ListStashResponse.Stash;
+import net.coding.ide.model.PersonIdent;
 import net.coding.ide.model.RepositoryState;
+import net.coding.ide.model.exception.GitCommitMessageNeedEditException;
 import net.coding.ide.model.exception.GitInvalidPathException;
 import net.coding.ide.model.exception.GitInvalidRefException;
 import net.coding.ide.model.exception.GitOperationException;
@@ -28,19 +36,18 @@ import org.eclipse.jgit.api.*;
 import org.eclipse.jgit.api.errors.CheckoutConflictException;
 import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.api.errors.JGitInternalException;
+import org.eclipse.jgit.blame.BlameResult;
 import org.eclipse.jgit.diff.DiffConfig;
 import org.eclipse.jgit.dircache.DirCache;
 import org.eclipse.jgit.dircache.DirCacheEntry;
 import org.eclipse.jgit.dircache.DirCacheIterator;
 import org.eclipse.jgit.errors.CorruptObjectException;
+import org.eclipse.jgit.errors.IncorrectObjectTypeException;
 import org.eclipse.jgit.errors.MissingObjectException;
 import org.eclipse.jgit.ignore.IgnoreNode;
 import org.eclipse.jgit.lib.*;
-import org.eclipse.jgit.revwalk.FollowFilter;
-import org.eclipse.jgit.revwalk.RevCommit;
-import org.eclipse.jgit.revwalk.RevTree;
-import org.eclipse.jgit.revwalk.RevWalk;
-import org.eclipse.jgit.revwalk.filter.RevFilter;
+import org.eclipse.jgit.revwalk.*;
+import org.eclipse.jgit.revwalk.filter.*;
 import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
 import org.eclipse.jgit.storage.file.WindowCacheConfig;
 import org.eclipse.jgit.transport.*;
@@ -50,6 +57,7 @@ import org.eclipse.jgit.treewalk.FileTreeIterator;
 import org.eclipse.jgit.treewalk.TreeWalk;
 import org.eclipse.jgit.treewalk.filter.PathFilter;
 import org.eclipse.jgit.util.IO;
+import org.modelmapper.ModelMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -57,30 +65,44 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.ApplicationEventPublisherAware;
 import org.springframework.context.ApplicationListener;
+import org.springframework.context.event.*;
+import org.springframework.context.event.EventListener;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
+import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 
 import java.io.*;
 import java.net.URISyntaxException;
 import java.nio.charset.Charset;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.PatternSyntaxException;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
 
 import static java.lang.String.format;
+import static net.coding.ide.git.rebase.RebaseActionHandler.DONE;
+import static net.coding.ide.utils.RebaseStateUtils.getRebaseFile;
+import static net.coding.ide.utils.RebaseStateUtils.getRebasePath;
 import static net.coding.ide.utils.RebaseTodoUtils.parseLines;
 import static org.apache.commons.lang.StringUtils.isBlank;
 import static org.apache.commons.lang.StringUtils.isNotBlank;
+import static net.coding.ide.git.rebase.RebaseActionHandler.handler;
 import static org.eclipse.jgit.lib.ConfigConstants.*;
+import static org.eclipse.jgit.lib.RefDatabase.ALL;
 
 /**
  * Created by vangie on 14/12/29.
  */
 @Slf4j
 @Service
-public class GitManagerImpl implements GitManager, ApplicationEventPublisherAware, ApplicationListener<WorkspaceStatusEvent> {
+public class GitManagerImpl implements GitManager, ApplicationEventPublisherAware {
     /**
      * Prefix for branch refs
      */
@@ -108,17 +130,7 @@ public class GitManagerImpl implements GitManager, ApplicationEventPublisherAwar
 
     private static final String GIT_REBASE_TODO = "git-rebase-todo";
 
-    /**
-     * The name of the "rebase-merge" folder for interactive rebases.
-     */
-    private static final String REBASE_MERGE = "rebase-merge"; //$NON-NLS-1$
-
-    /**
-     * The name of the "rebase-apply" folder for non-interactive rebases.
-     */
-    private static final String REBASE_APPLY = "rebase-apply"; //$NON-NLS-1$
-
-    private static final String DONE = "done"; //$NON-NLS-1$
+    public static final int ABBREVIATION_LENGTH = 7;
 
     private ApplicationEventPublisher publisher;
 
@@ -136,6 +148,17 @@ public class GitManagerImpl implements GitManager, ApplicationEventPublisherAwar
 
     @Value("${EMAIL}")
     private String email;
+
+    @Autowired
+    private ModelMapper mapper;
+
+    private Map<RebaseTodoLine.Action, RebaseActionHandler> actionHandlers = Maps.uniqueIndex(
+            Arrays.asList(
+                    new EditActionHandler(),
+                    new SquashActionHandler(),
+                    new RewordActionHandler()),
+
+            RebaseActionHandler::getAction);
 
     public GitManagerImpl() {
         synchronized (this) {
@@ -267,21 +290,19 @@ public class GitManagerImpl implements GitManager, ApplicationEventPublisherAwar
 
         CredentialsProvider cp = this.getCredentialsProvider(ws);
 
-        String sshUrl = wsRepo.findProjectBySpaceKey(ws.getSpaceKey()).getSshUrl();
+        String url = wsRepo.findProjectBySpaceKey(ws.getSpaceKey()).getUrl();
 
         try (Git git = new Git(repository)){
             git.cloneRepository()
                     .setBare(false)
                     .setCloneAllBranches(true)
                     .setDirectory(ws.getWorkingDir())
-                    .setURI(sshUrl)
+                    .setURI(url)
                     .setCredentialsProvider(cp)
                     .call()
                     .getRepository()
                     .close();
         }
-
-        fetch(ws);
 
         return hasAtLeastOneReference(repository);
 
@@ -389,13 +410,14 @@ public class GitManagerImpl implements GitManager, ApplicationEventPublisherAwar
     }
 
     @Override
-    public void createStash(Workspace ws, String message) throws GitAPIException, GitOperationException {
+    public void createStash(Workspace ws, boolean includeUntracked, String message) throws GitAPIException, GitOperationException {
         Repository repository = getRepository(ws.getSpaceKey());
+
 
         try (Git git = Git.wrap(repository)) {
             StashCreateCommand createCommand = git.stashCreate();
 
-            createCommand.setIncludeUntracked(false);
+            createCommand.setIncludeUntracked(includeUntracked);
 
             if (!isBlank(message)) {
                 createCommand.setWorkingDirectoryMessage(message);
@@ -617,64 +639,32 @@ public class GitManagerImpl implements GitManager, ApplicationEventPublisherAwar
 
     /**
      * edit 状态需要 --amend
-     * @param ws
-     * @param operation
-     * @return
      * @throws GitAPIException
      */
     public RebaseResponse operateRebase(Workspace ws, RebaseOperation operation, String message) throws GitAPIException, IOException {
         Repository repository = getRepository(ws.getSpaceKey());
 
         try (Git git = Git.wrap(repository)) {
-            boolean amend = false;
-
             if (operation.equals(RebaseOperation.CONTINUE)) {
                 try {
                     List<RebaseTodoLine> rebaseTodoLines = repository.readRebaseTodo(getRebasePath(repository, DONE), false);
 
-                    if (rebaseTodoLines.size() != 0) {
+                    Status status = git.status().call();
+
+                    if (rebaseTodoLines.size() != 0 && status.getConflicting().size() == 0) {
+
                         // the last rebase_todo_line
                         RebaseTodoLine line = rebaseTodoLines.get(rebaseTodoLines.size() - 1);
 
-                        Status status = git.status().call();
+                        RebaseActionHandler handler = actionHandlers.get(line.getAction());
 
-                        // need amend
-                        if (line.getAction().equals(RebaseTodoLine.Action.EDIT) && status.getConflicting().size() == 0) {
+                        if (handler != null) {
                             if (message != null) {
-                                git.commit()
-                                        .setAll(true)
-                                        .setAmend(true)
-                                        .setNoVerify(true)
-                                        .setMessage(message)
-                                        .call();
-
-                                amend = true;
-                            } else { // tel frontend need message paramter
-                                File messageFile = getRebaseFile(repository, "message");
-
-                                RebaseResponse response = new RebaseResponse(false, RebaseResponse.Status.INTERACTIVE_EDIT);
-
-                                if (messageFile.exists()) {
-                                    response.setMessage(new String(IO.readFully(messageFile)));
-                                }
-
-                                return response;
+                                return handler.process(repository, message);
+                            } else {
+                                return handler.extractMessage(repository);
                             }
-                        } /*else if (line.getAction().equals(RebaseTodoLine.Action.REWORD)) { // todo: reward coundn't be stoped
-                        if (message != null) {
-                            git.rebase().runInteractively(new RebaseCommand.InteractiveHandler() {
-                                @Override
-                                public void prepareSteps(List<RebaseTodoLine> steps) {
-                                    // do nothing
-                                }
-
-                                @Override
-                                public String modifyCommitMessage(String commit) {
-                                    return message;
-                                }
-                            }).setOperation(RebaseCommand.Operation.CONTINUE).call();
                         }
-                    }*/
                     }
                 } catch (FileNotFoundException e) {
                     // nothing_todo if done not exist
@@ -683,15 +673,14 @@ public class GitManagerImpl implements GitManager, ApplicationEventPublisherAwar
 
             RebaseResult result = git.rebase()
                     .setOperation(RebaseCommand.Operation.valueOf(operation.name()))
+                    .runInteractively(handler)
                     .call();
 
-            // 如果 conflict and edit，amend 后 continue 会返回 NOTHING_TO_COMMIT
-            // so skip this commit
-            if (amend && result.getStatus().equals(RebaseResult.Status.NOTHING_TO_COMMIT)) {
-                result = git.rebase().setOperation(RebaseCommand.Operation.SKIP).call();
-            }
-
             return new RebaseResponse(result);
+        } catch (GitCommitMessageNeedEditException e) {
+            RebaseResponse response = new RebaseResponse(false, RebaseResponse.Status.INTERACTIVE_EDIT);
+            response.setMessage(e.getMessage());
+            return response;
         }
     }
 
@@ -704,44 +693,20 @@ public class GitManagerImpl implements GitManager, ApplicationEventPublisherAwar
         return RepositoryState.valueOf(state.name());
     }
 
-    /***
-     * @see RebaseCommand.RebaseState#getDir()
-     */
-    private File getRebaseStateDir(Repository repository) {
-        File file = null;
-
-        File rebaseApply = new File(repository.getDirectory(), REBASE_APPLY);
-        if (rebaseApply.exists()) {
-            file = rebaseApply;
-        } else {
-            file = new File(repository.getDirectory(), REBASE_MERGE);
-        }
-
-        return file;
-    }
-
-    public File getRebaseFile(Repository repository, String name) {
-        return new File(getRebaseStateDir(repository), name);
-    }
-
-    public String getRebasePath(Repository repository, String name) {
-        return (getRebaseStateDir(repository).getName() + "/" + name); //$NON-NLS-1$
-    }
-
     private void generate_conflict_files(Workspace ws, ObjectId base, ObjectId local, ObjectId remote, String path) throws IOException {
         Repository repository = getRepository(ws.getSpaceKey());
 
         String content = readBlobContent(repository, base, ws.getEncoding());
 
-        ws.write(path + CONFLIX_FILE_BASE_SUFFIX, content, false, true, false);
+        ws.write(path + CONFLIX_FILE_BASE_SUFFIX, content, ws.getEncoding(), false, true, false);
 
         content = readBlobContent(repository, local, ws.getEncoding());
 
-        ws.write(path + CONFLIX_FILE_LOCAL_SUFFIX, content, false, true, false);
+        ws.write(path + CONFLIX_FILE_LOCAL_SUFFIX, content, ws.getEncoding(), false, true, false);
 
         content = readBlobContent(repository, remote, ws.getEncoding());
 
-        ws.write(path + CONFLIX_FILE_REMOTE_SUFFIX, content, false, true, true);
+        ws.write(path + CONFLIX_FILE_REMOTE_SUFFIX, content, ws.getEncoding(), false, true, true);
     }
 
 
@@ -762,14 +727,20 @@ public class GitManagerImpl implements GitManager, ApplicationEventPublisherAwar
         return content.toString(encoding);
     }
 
+    public String readFileFromRef(Workspace ws, String ref, String path, boolean base64) throws IOException {
+        return readFileFromRef(ws, ref, path, ws.getEncoding(), base64);
+    }
+
     /**
      * 读取某次提交的的某个文件的内容
      */
     @Override
-    public String readFileFromRef(Workspace ws, String ref, String path, boolean base64) throws IOException {
+    public String readFileFromRef(Workspace ws, String ref, String path, String encoding, boolean base64) throws IOException {
         Repository repository = getRepository(ws.getSpaceKey());
 
         ObjectId objectId = repository.resolve(ref);
+
+        String relativePath = ws.getRelativePath(path).toString();
 
         if (objectId == null) {
             throw new GitInvalidRefException(format("ref %s is not exist", ref));
@@ -784,7 +755,7 @@ public class GitManagerImpl implements GitManager, ApplicationEventPublisherAwar
             try (TreeWalk treeWalk = new TreeWalk(repository)) {
                 treeWalk.addTree(tree);
                 treeWalk.setRecursive(true);
-                treeWalk.setFilter(PathFilter.create(path));
+                treeWalk.setFilter(PathFilter.create(relativePath));
 
                 if (!treeWalk.next()) {
                     throw new GitInvalidPathException(format("Did not find expected file '%s'", path));
@@ -803,7 +774,11 @@ public class GitManagerImpl implements GitManager, ApplicationEventPublisherAwar
                 if (base64) {
                     return BaseEncoding.base64().encode(content);
                 } else {
-                    return new String(content, ws.getEncoding());
+                    if (StringUtils.isNotBlank(encoding)) {
+                        return new String(content, encoding);
+                    } else {
+                        return new String(content, ws.getEncoding());
+                    }
                 }
             }
         }
@@ -812,6 +787,8 @@ public class GitManagerImpl implements GitManager, ApplicationEventPublisherAwar
     @Override
     public ConflictFile queryConflictFile(Workspace ws, String path, boolean base64) throws Exception {
         GitStatus status = status(ws, ws.getRelativePath(path));
+
+        String relativePath = ws.getRelativePath(path).toString();
 
         if (!status.equals(GitStatus.CONFLICTION)) {
             throw new GitOperationException(format("status of %s is not confliction", path));
@@ -826,7 +803,7 @@ public class GitManagerImpl implements GitManager, ApplicationEventPublisherAwar
                 || !ws.exists(remotePath)) {
             Repository repository = getRepository(ws.getSpaceKey());
 
-            DirCacheEntry[] entries = findEntrys(repository, ws.getRelativePath(path).toString());
+            DirCacheEntry[] entries = findEntrys(repository, relativePath);
 
             ObjectId local = null, remote = null, base = null;
 
@@ -841,9 +818,9 @@ public class GitManagerImpl implements GitManager, ApplicationEventPublisherAwar
 
         ConflictFile response = new ConflictFile();
 
-        response.setBase(ws.read(basePath, base64));
-        response.setLocal(ws.read(localPath, base64));
-        response.setRemote(ws.read(remotePath, base64));
+        response.setBase(ws.read(basePath, ws.getEncoding(), base64));
+        response.setLocal(ws.read(localPath, ws.getEncoding(), base64));
+        response.setRemote(ws.read(remotePath, ws.getEncoding(), base64));
 
         return response;
     }
@@ -937,9 +914,9 @@ public class GitManagerImpl implements GitManager, ApplicationEventPublisherAwar
                     GitStatus gitStatus = f.getStatus();
 
                     if (gitStatus == GitStatus.REMOVED) {
-                        new Git(repository).rm().addFilepattern(file).call();
+                        git.rm().addFilepattern(file).call();
                     } else if (gitStatus != GitStatus.MISSING){
-                        new Git(repository).add().addFilepattern(file).call();
+                        git.add().addFilepattern(file).call();
                         result.add(file);
                     }
 
@@ -963,6 +940,233 @@ public class GitManagerImpl implements GitManager, ApplicationEventPublisherAwar
         }
 
         return commit(ws, files, message);
+    }
+
+    private RevFilter processRevFilter(String[] authors, Long since, Long until) {
+        RevFilter dateRevFilter = null;
+        if (since != null && until != null) {
+            dateRevFilter = CommitTimeRevFilter.between(since, until);
+        } else if (until != null){
+            dateRevFilter = CommitTimeRevFilter.before(until);
+        } else if (since != null) {
+            dateRevFilter = CommitTimeRevFilter.after(since);
+        }
+
+        RevFilter authorRevFilter = null;
+
+        if (authors != null && authors.length != 0) {
+            RevFilter[] authFilters = Arrays.stream(authors)
+                    .map(author -> AuthorRevFilter.create(author))
+                    .toArray(RevFilter[]::new);
+
+            if (authFilters.length == 1) {
+                authorRevFilter = authFilters[0];
+            } else if (authFilters.length >= 2) {
+                authorRevFilter = OrRevFilter.create(authFilters); // 同一类的 filter 使用 or，不同类型的则使用 and
+            }
+        }
+
+        RevFilter[] revFilters = Stream.of(dateRevFilter, authorRevFilter) // may contains null
+                .filter(f -> f != null)
+                .toArray(RevFilter[]::new);
+
+        if (revFilters.length >= 2) {
+            return AndRevFilter.create(revFilters); // 同一类的 filter 使用 or，不同类型的则使用 and
+        } else if (revFilters.length == 1){
+            return revFilters[0];
+        } else {
+            return null;
+        }
+    }
+
+    /**
+     * list all refs except stash for graph log
+     */
+    public List<GitRef> refs(Workspace ws) throws IOException, GitAPIException {
+
+        Repository repository = getRepository(ws.getSpaceKey());
+
+        try (Git git = Git.wrap(repository)) {
+
+            Map<String, Ref> refs = repository.getRefDatabase().getRefs(RefDatabase.ALL);
+
+            refs.remove(Constants.R_STASH);
+
+            return refs.values()
+                    .stream()
+                    .map(ref -> {
+                        if (! ref.isPeeled() )
+                            ref = repository.peel(ref);
+                        return ref;
+                    })
+                    .map(ref -> {
+                        ObjectId objectId = ref.getPeeledObjectId();
+                        if (objectId == null) {
+                            objectId = ref.getObjectId();
+                        }
+
+                        return GitRef.builder()
+                                .name(ref.getName())
+                                .id(objectId.getName())
+                                .build();
+                    }).collect(Collectors.toList());
+        }
+    }
+
+    // if all is false and ref is null, it will use HEAD as default
+    public List<GitLog> log(Workspace ws,
+                            String[] ref,
+                            String[] path,
+                            String[] authors,
+                            Long since,
+                            Long until,
+                            Pageable pageable) throws GitAPIException, IOException {
+
+
+        return log(ws, ref, path,
+                processRevFilter(authors, since, until),
+                pageable);
+    }
+
+    // if all is false and ref is null, it will use HEAD as default
+    private List<GitLog> log(Workspace ws, String[] refs, String[] path, RevFilter revFilter, Pageable pageable) throws GitAPIException, IOException {
+        Repository repository = getRepository(ws.getSpaceKey());
+
+        try (Git git = Git.wrap(repository)) {
+
+            LogCommand logCommand = git.log()
+                    .setSkip(pageable.getOffset())
+                    .setMaxCount(pageable.getPageSize());
+
+
+            boolean all = true;
+
+            if (refs != null && refs.length != 0) { // if refs avaliable
+                Arrays.stream(refs)
+                        .filter(r -> r != null)
+                        .map(r -> resolveAndAssertNotNull(repository, r))
+                        .forEach(objectId -> addStartRefForLog(logCommand, objectId));
+
+                all = false;
+            }
+
+            if (all) {
+                Map<String, Ref> allRefs = repository.getRefDatabase().getRefs(ALL);
+
+                // @see LogCommand##all()
+                allRefs.values().stream()  // all but not stash refs
+                        .filter(r -> ! r.getName().equals(Constants.R_STASH))
+                        .map(r -> {
+                            if( ! r.isPeeled() )
+                                r = repository.peel(r);
+
+                            ObjectId objectId = r.getPeeledObjectId();
+                            if (objectId == null)
+                                objectId = r.getObjectId();
+                            return objectId;
+                        }).forEach(objectId -> {
+                            try {
+                                logCommand.add(objectId);
+                            } catch (MissingObjectException e) {
+                                // ignore: the ref points to an object that does not exist;
+                                // it should be ignored as traversal starting point.
+                            } catch (IncorrectObjectTypeException e) {
+                                // ignore: the ref points to an object that is not a commit
+                                // (e.g. a tree or a blob);
+                                // it should be ignored as traversal starting point.
+                            }
+                        });
+            }
+
+            if (path != null && path.length != 0) { // add path filters
+                Arrays.stream(path)
+                        .filter(p -> p != null)
+                        .map(p -> getRelativePath(ws, p))
+                        .filter(Strings::isNullOrEmpty)
+                        .filter(r -> ! r.equals("."))
+                        .forEach(logCommand::addPath);
+            }
+
+            // remove stash refs
+
+            try (RevWalk revCommits = (RevWalk) logCommand.call()) {
+                revCommits.sort(RevSort.TOPO, true);
+
+                if (revFilter != null) { // add rev filters, including date, user, message
+                    revCommits.setRevFilter(revFilter);
+                }
+
+                return StreamSupport.stream(revCommits.spliterator(), false)
+                        .map(revCommit -> {
+                            GitLog log = mapper.map(revCommit, GitLog.class);
+
+                            String[] parents = Arrays.stream(revCommit.getParents())
+                                    .map(RevCommit::name)
+                                    .toArray(String[]::new);
+
+                            log.setParents(parents);
+                            log.setCommiterIdent(mapper.map(revCommit.getCommitterIdent(), PersonIdent.class));
+                            log.setAuthorIdent(mapper.map(revCommit.getAuthorIdent(), PersonIdent.class));
+                            log.setShortName(revCommit.abbreviate(ABBREVIATION_LENGTH).name());
+
+                            return log;
+                        }).collect(Collectors.toList());
+            }
+        }
+    }
+
+    @SneakyThrows(IOException.class)
+    private ObjectId resolveAndAssertNotNull(Repository repository, String ref) {
+        ObjectId objectId = repository.resolve(ref);
+
+        if (objectId == null) // if specify a ref, all could not be used
+            throw new GitInvalidRefException(format("ref %s is not exist", ref));
+
+        return objectId;
+    }
+
+    @SneakyThrows(AccessDeniedException.class)
+    private String getRelativePath(Workspace ws, String path) {
+        return ws.getRelativePath(path).toString();
+    }
+
+    @SneakyThrows(IOException.class)
+    private void addStartRefForLog(LogCommand logCommand, ObjectId objectId) {
+        logCommand.add(objectId);
+    }
+
+    public List<GitBlame> blame(Workspace ws, String path) throws AccessDeniedException, GitAPIException {
+        Repository repository = getRepository(ws.getSpaceKey());
+
+        String relativePath = ws.getRelativePath(path).toString();
+
+        try (Git git = Git.wrap(repository)) {
+            BlameResult blameResult = git.blame()
+                    .setFilePath(relativePath)
+                    .setFollowFileRenames(true)
+                    .call();
+
+            if (blameResult == null) { // file not exist
+                return Lists.newArrayList();
+            }
+
+            int lineCnt = blameResult.getResultContents().size();
+
+            return IntStream.range(0, lineCnt)
+                    .mapToObj(i -> {
+                        org.eclipse.jgit.lib.PersonIdent author = blameResult.getSourceAuthor(i);
+                        RevCommit commit = blameResult.getSourceCommit(i);
+
+                        GitBlame.GitBlameBuilder builder = GitBlame.builder()
+                                .author(mapper.map(author, PersonIdent.class));
+
+                        if (commit != null) {
+                            builder.shortName(commit.abbreviate(ABBREVIATION_LENGTH).name());
+                        }
+
+                        return builder.build();
+                    }).collect(Collectors.toList());
+        }
     }
 
     @Override
@@ -1634,12 +1838,13 @@ public class GitManagerImpl implements GitManager, ApplicationEventPublisherAwar
         return ignoreNode.isIgnored(path, isDir) == IgnoreNode.MatchResult.IGNORED;
     }
 
-    @Override
-    public void onApplicationEvent(WorkspaceStatusEvent event) {
+
+    @Order(Ordered.HIGHEST_PRECEDENCE)
+    @EventListener
+    public void handleWorkspaceStatusEvent(WorkspaceStatusEvent event) {
         String spaceKey = event.getSpaceKey();
-        if (event instanceof WorkspaceOfflineEvent) {
-            invalidateRepository(spaceKey);
-        } else if (event instanceof WorkspaceDeleteEvent) {
+        if (event instanceof WorkspaceOfflineEvent
+                || event instanceof WorkspaceDeleteEvent) {
             invalidateRepository(spaceKey);
         }
     }
